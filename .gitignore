@@ -1,0 +1,9 @@
+STREAM/
+build/
+*.o
+baseline
+blocked
+sgemm_peak
+stream_c.exe
+results/*.out
+.t
