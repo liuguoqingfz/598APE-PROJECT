@@ -5,7 +5,6 @@ baseline
 blocked
 sgemm_peak
 stream_c.exe
-results/*.out
 .t
 tests/test_gemm_correctness
 tests/test_gemm_large
