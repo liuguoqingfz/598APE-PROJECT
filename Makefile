@@ -1,109 +1,149 @@
-# ==== Config (override at CLI: make TRIALS=7 N=2048 MB=128 NB=128 KB=256) ====
-CC      ?= gcc
-CSTD    ?= -std=c11
-CFLAGS  ?= -O3 -march=native -Wall -Wextra $(CSTD) -fopenmp
-LDFLAGS ?= -fopenmp -lpthread -lm
-BLAS    ?= -lopenblas
+CC       := gcc
+CSTD     := -std=c11
+CFLAGS   ?= -O3 -march=native -fopenmp -Wall -Wextra $(CSTD)
+LDFLAGS  ?= -fopenmp
+LIBS     ?= -lopenblas
+INCLUDES := -Isrc
+CFLAGS += -D_POSIX_C_SOURCE=200112L
+
+SRC_DIR     := src
+TEST_DIR    := tests
+SCRIPT_DIR  := scripts
+DASH_DIR    := dash
+BUILD_DIR   := build
+BIN_DIR     := $(BUILD_DIR)/bin
+RESULTS_DIR := results
 
 THREADS ?= 4
-N       ?= 2048
+N       ?= 1024
 TRIALS  ?= 5
 MB      ?= 96
 NB      ?= 96
 KB      ?= 256
 
-STREAM_ARRAY_SIZE ?= 50000000
-NTIMES            ?= 20
+BASELINE_SRC := $(SRC_DIR)/gemm_baseline.c
+BLOCKED_SRC  := $(SRC_DIR)/gemm_blocked.c
+PEAK_SRC     := $(SRC_DIR)/sgemm_peak.c
+GEMM_HDR     := $(SRC_DIR)/gemm.h
 
-SRC     := src
-TEST    := tests
-BUILD   := build
-RESULTS := results
+BASELINE_BIN := $(BIN_DIR)/gemm_baseline
+BLOCKED_BIN  := $(BIN_DIR)/gemm_blocked
+PEAK_BIN     := $(BIN_DIR)/sgemm_peak
 
-# ==== Phony targets ====
-.PHONY: all dirs test perf-large roofline calibrate-mem calibrate-comp collect clean help
+STREAM_DIR   := STREAM
+STREAM_EXE   := $(STREAM_DIR)/stream_c.exe
+STREAM_EXTRA := -O3 -march=native -fopenmp -DSTREAM_ARRAY_SIZE=50000000 -DNTIMES=20
 
-all: baseline blocked
+CALJSON      := $(RESULTS_DIR)/calibration.json
+STREAM_OUT   := $(RESULTS_DIR)/stream.out
+PEAK_OUT     := $(RESULTS_DIR)/sgemm_peak.out
+RESULTS_CSV  := $(RESULTS_DIR)/results.csv
+LARGE_CSV    := $(RESULTS_DIR)/large_runs.csv
+ROOFLINE_PNG := $(RESULTS_DIR)/roofline.png
+
+.PHONY: all dirs clean distclean \
+        test baseline blocked sgemm_peak \
+        calibrate-mem calibrate-comp \
+        collect perf-large roofline \
+        memcheck-test memcheck-baseline memcheck-blocked memcheck-sgemm \
+        print-vars stream-build
+
+all: dirs baseline blocked sgemm_peak
 
 dirs:
-	@mkdir -p $(BUILD) $(RESULTS)
+	@mkdir -p $(BIN_DIR) $(RESULTS_DIR)
 
-# ==== Objects (no main) for linking into tests ====
-$(BUILD)/gemm_baseline.o: $(SRC)/gemm_baseline.c $(SRC)/gemm.h | dirs
-	$(CC) $(CFLAGS) -DGEMM_NO_MAIN -c $< -o $@
+$(BASELINE_BIN): $(BASELINE_SRC) $(GEMM_HDR) | dirs
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $(BASELINE_SRC) $(LDFLAGS) $(LIBS)
 
-$(BUILD)/gemm_blocked.o: $(SRC)/gemm_blocked.c $(SRC)/gemm.h | dirs
-	$(CC) $(CFLAGS) -DGEMM_NO_MAIN -DMB=$(MB) -DNB=$(NB) -DKB=$(KB) -c $< -o $@
+$(BLOCKED_BIN): $(BLOCKED_SRC) $(GEMM_HDR) | dirs
+	$(CC) $(CFLAGS) $(INCLUDES) -DMB=$(MB) -DNB=$(NB) -DKB=$(KB) -o $@ $(BLOCKED_SRC) $(LDFLAGS) $(LIBS)
 
-# ==== Binaries for quick manual runs ====
-baseline: $(SRC)/gemm_baseline.c | dirs
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+$(PEAK_BIN): $(PEAK_SRC) | dirs
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $(PEAK_SRC) $(LDFLAGS) $(LIBS)
 
-blocked: $(SRC)/gemm_blocked.c | dirs
-	$(CC) $(CFLAGS) -DMB=$(MB) -DNB=$(NB) -DKB=$(KB) $< -o $@ $(LDFLAGS)
+baseline: $(BASELINE_BIN)
+blocked:  $(BLOCKED_BIN)
+sgemm_peak: $(PEAK_BIN)
 
-sgemm_peak: $(SRC)/sgemm_peak.c | dirs
-	$(CC) $(CFLAGS) $< -o $@ $(BLAS) $(LDFLAGS)
+stream-build: | dirs
+	@echo "[stream] Building upstream STREAM C target with your flags…"
+	@$(MAKE) -C $(STREAM_DIR) CC=$(CC) EXTRA_FLAGS="$(STREAM_EXTRA)"
 
-# ==== Unit tests ====
-test: $(TEST)/test_gemm_correctness.c $(BUILD)/gemm_baseline.o $(BUILD)/gemm_blocked.o | dirs
-	$(CC) $(CFLAGS) $^ -o $(TEST)/test_gemm_correctness $(BLAS) $(LDFLAGS)
+calibrate-mem: stream-build
+	@echo "[calibrate-mem] Running STREAM Triad with pinned threads…"
+	@OMP_NUM_THREADS=$$(nproc) OMP_PROC_BIND=close OMP_PLACES=cores \
+		$(STREAM_EXE) | tee $(STREAM_OUT)
+	@echo "[calibrate-mem] Parsing Triad MB/s and updating $(CALJSON)"
+	@mkdir -p $(RESULTS_DIR) && [ -f $(CALJSON) ] || echo '{}' > $(CALJSON)
+	@MBPS=$$(awk '/^Triad:/ {print $$2; exit}' $(STREAM_OUT)); \
+	GBPS=$$(awk -v m=$$MBPS 'BEGIN{printf "%.3f", m/1024.0}'); \
+	jq --argjson b $$GBPS '.B_mem_GBs = $$b' $(CALJSON) > $(CALJSON).tmp && mv $(CALJSON).tmp $(CALJSON)
+	@echo "[calibrate-mem] B_mem_GBs=$$(jq -r '.B_mem_GBs' $(CALJSON))"
+
+calibrate-comp: $(PEAK_BIN)
+	@echo "[calibrate-comp] Running SGEMM peak…"
+	@OMP_NUM_THREADS=$(THREADS) OMP_PROC_BIND=close OMP_PLACES=cores \
+		$(PEAK_BIN) | tee $(PEAK_OUT)
+	@echo "[calibrate-comp] Parsing GFLOP/s and updating $(CALJSON)"
+	@mkdir -p $(RESULTS_DIR) && [ -f $(CALJSON) ] || echo '{}' > $(CALJSON)
+	@GF=$$(awk 'match($$0,/GFLOP\/s=([0-9.]+)/,a){print a[1]}' $(PEAK_OUT) | tail -n1); \
+	jq --argjson f $$GF '.F_peak_GFLOPs = $$f' $(CALJSON) > $(CALJSON).tmp && mv $(CALJSON).tmp $(CALJSON)
+	@echo "[calibrate-comp] F_peak_GFLOPs=$$(jq -r '.F_peak_GFLOPs' $(CALJSON))"
+
+test: $(BASELINE_BIN) $(BLOCKED_BIN)
+	@echo "[test] Building and running unit tests..."
+	$(CC) $(CFLAGS) -DGEMM_NO_MAIN $(INCLUDES) -o $(BIN_DIR)/test_gemm_correctness \
+		$(TEST_DIR)/test_gemm_correctness.c src/gemm_baseline.c src/gemm_blocked.c \
+		$(LDFLAGS) $(LIBS)
 	OMP_NUM_THREADS=$(THREADS) OMP_PROC_BIND=close OMP_PLACES=cores \
-		$(TEST)/test_gemm_correctness
+		$(BIN_DIR)/test_gemm_correctness
 
-# ==== Large performance test (produces results/large_runs.csv) ====
-perf-large: $(TEST)/test_gemm_large.c $(BUILD)/gemm_baseline.o $(BUILD)/gemm_blocked.o | dirs
-	$(CC) $(CFLAGS) $^ -o $(TEST)/test_gemm_large $(LDFLAGS)
-	@echo "variant,n,threads,flops,time_s,gflops,date" > $(RESULTS)/large_runs.csv
-	OMP_NUM_THREADS=$(THREADS) OMP_PROC_BIND=close OMP_PLACES=cores \
-		$(TEST)/test_gemm_large) baseline $(N) $(TRIALS) | tee -a $(RESULTS)/large_runs.csv
-	OMP_NUM_THREADS=$(THREADS) OMP_PROC_BIND=close OMP_PLACES=cores \
-		$(TEST)/test_gemm_large) blocked  $(N) $(TRIALS) | tee -a $(RESULTS)/large_runs.csv
-	@echo "Wrote $(RESULTS)/large_runs.csv"
+perf-large: $(BASELINE_BIN) $(BLOCKED_BIN)
+	@echo "[perf-large] N=$(N) TRIALS=$(TRIALS) THREADS=$(THREADS)"
+	@mkdir -p $(RESULTS_DIR)
+	@bash $(SCRIPT_DIR)/collect.sh baseline $(N) $(TRIALS) $(THREADS) >> $(LARGE_CSV)
+	@bash $(SCRIPT_DIR)/collect.sh blocked  $(N) $(TRIALS) $(THREADS) >> $(LARGE_CSV)
+	@echo "[perf-large] Wrote $(LARGE_CSV)"
 
-# ==== Calibration helpers (optional, if you use the scripted flow) ====
-# Build and run STREAM C-only; parse Triad (MB/s) -> GB/s and write calibration.json (B_mem only)
-calibrate-mem: STREAM/stream.c | dirs
-	$(CC) -O3 -march=native -fopenmp \
-		-DSTREAM_ARRAY_SIZE=$(STREAM_ARRAY_SIZE) -DNTIMES=$(NTIMES) \
-		STREAM/stream.c -o stream_c.exe
-	OMP_NUM_THREADS=$(THREADS) ./stream_c.exe | tee $(RESULTS)/stream.out
-	@B_MEM=$$(awk '/^Triad:/ {print $$2}' $(RESULTS)/stream.out | sort -nr | head -1 | awk '{printf "%.3f", $$1/1000.0}'); \
-	echo "{ \"B_mem_GBs\": $$B_MEM, \"F_peak_GFLOPs\": null }" > $(RESULTS)/calibration.json; \
-	echo "Wrote $(RESULTS)/calibration.json with B_mem_GBs=$$B_MEM"
+collect: $(BASELINE_BIN) $(BLOCKED_BIN)
+	@echo "[collect] Appending sweeps to $(RESULTS_CSV)"
+	@bash $(SCRIPT_DIR)/collect.sh baseline $(N) $(TRIALS) $(THREADS) >> $(RESULTS_CSV)
+	@bash $(SCRIPT_DIR)/collect.sh blocked  $(N) $(TRIALS) $(THREADS) >> $(RESULTS_CSV)
+	@echo "[collect] Wrote $(RESULTS_CSV)"
 
-# Run SGEMM peak, parse GFLOP/s number, and merge into calibration.json (requires jq)
-calibrate-comp: sgemm_peak | dirs
-	OMP_NUM_THREADS=$(THREADS) ./sgemm_peak | tee $(RESULTS)/sgemm_peak.out
-	@F_PEAK=$$(grep -oE 'GFLOP/s=([0-9]+(\.[0-9]+)?)' $(RESULTS)/sgemm_peak.out | sed 's/.*=//'); \
-	B_MEM=$$(jq -r '.B_mem_GBs' $(RESULTS)/calibration.json); \
-	tmp=$$(mktemp); \
-	jq -n --argjson b "$$B_MEM" --argjson f "$$F_PEAK" \
-	   '{B_mem_GBs: $$b, F_peak_GFLOPs: $$f}' > $$tmp && mv $$tmp $(RESULTS)/calibration.json; \
-	echo "Updated $(RESULTS)/calibration.json with F_peak_GFLOPs=$$F_PEAK"
+roofline: $(RESULTS_CSV) $(CALJSON)
+	@echo "[roofline] Generating $(ROOFLINE_PNG)"
+	@python3 $(DASH_DIR)/roofline_plot.py --csv $(RESULTS_CSV) --cal $(CALJSON) --out $(ROOFLINE_PNG)
+	@echo "[roofline] Done: $(ROOFLINE_PNG)"
 
-# ==== Data collection helper (uses scripts/collect.sh from earlier steps) ====
-collect: baseline blocked | dirs
-	./scripts/collect.sh baseline $(N) $(TRIALS)
-	./scripts/collect.sh blocked  $(N) $(TRIALS)
+VALGRIND := valgrind --leak-check=full --track-origins=yes --error-exitcode=1
 
-# ==== Plot (requires results/calibration.json and results/results.csv) ====
-roofline: dash/roofline_plot.py | dirs
-	python3 dash/roofline_plot.py
+memcheck-test: $(BASELINE_BIN) $(BLOCKED_BIN)
+	$(CC) -O2 -g -DGEMM_NO_MAIN $(INCLUDES) -o $(BIN_DIR)/test_gemm_correctness_dbg \
+		$(TEST_DIR)/test_gemm_correctness.c $(BASELINE_SRC) $(BLOCKED_SRC) $(LDFLAGS) $(LIBS)
+	OMP_NUM_THREADS=1 $(VALGRIND) $(BIN_DIR)/test_gemm_correctness_dbg
 
-# ==== Cleanup ====
+memcheck-baseline: $(BASELINE_BIN)
+	OMP_NUM_THREADS=1 $(VALGRIND) $(BASELINE_BIN) 128
+
+memcheck-blocked: $(BLOCKED_BIN)
+	OMP_NUM_THREADS=1 $(VALGRIND) $(BLOCKED_BIN) 128
+
+memcheck-sgemm: $(PEAK_BIN)
+	OPENBLAS_NUM_THREADS=1 GOTO_NUM_THREADS=1 BLIS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+	OMP_NUM_THREADS=1 $(VALGRIND) $(PEAK_BIN) 256
+
 clean:
-	rm -rf $(BUILD) baseline blocked sgemm_peak stream_c.exe \
-	       $(TEST)/test_gemm_correctness) $(TEST)/test_gemm_large) \
-	       $(RESULTS)/large_runs.csv
+	@rm -rf $(BUILD_DIR)
 
-help:
-	@echo "Targets:"
-	@echo "  all               - build baseline and blocked"
-	@echo "  test              - build & run unit tests"
-	@echo "  perf-large        - build & run large perf test -> results/large_runs.csv"
-	@echo "  calibrate-mem     - build+run STREAM (C) and write B_mem to calibration.json"
-	@echo "  calibrate-comp    - run sgemm_peak and update F_peak in calibration.json"
-	@echo "  collect           - run scripts/collect.sh for baseline/blocked (uses N,TRIALS)"
-	@echo "  roofline          - plot roofline (needs calibration.json and results.csv)"
-	@echo "Vars (overridable): THREADS N TRIALS MB NB KB STREAM_ARRAY_SIZE NTIMES"
+distclean: clean
+	@rm -f $(STREAM_OUT) $(PEAK_OUT) $(ROOFLINE_PNG)
+	@rm -f $(RESULTS_CSV) $(LARGE_CSV)
+	@rm -f $(CALJSON)
+
+print-vars:
+	@echo "CFLAGS=$(CFLAGS)"
+	@echo "LDFLAGS=$(LDFLAGS)"
+	@echo "LIBS=$(LIBS)"
+	@echo "THREADS=$(THREADS) N=$(N) TRIALS=$(TRIALS) MB=$(MB) NB=$(NB) KB=$(KB)"

@@ -1,15 +1,4 @@
 #!/usr/bin/env python3
-"""
-Write calibration.json from environment variables B_MEM and F_PEAK.
-
-Usage:
-  B_MEM=<gbps> F_PEAK=<gflops> python3 scripts/write_calibration.py
-
-Notes:
-  - Expects the project layout .../results/calibration.json
-  - Fails with a clear message if variables are missing or not numeric.
-"""
-
 import json
 import os
 import sys
@@ -39,7 +28,6 @@ def main() -> int:
 
     data = {"B_mem_GBs": b_val, "F_peak_GFLOPs": f_val}
 
-    # Write atomically: write to temp file, then replace
     tmp_path = out_path.with_suffix(".json.tmp")
     with tmp_path.open("w") as fh:
         json.dump(data, fh, indent=2)

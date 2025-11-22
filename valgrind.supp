@@ -1,0 +1,16 @@
+{
+  libgomp_still_reachable
+  Memcheck:Leak
+  match-leak-kinds: reachable
+  fun:malloc
+  fun:__kmp_allocate
+  ...
+  obj:/usr/lib/*/libgomp.so*
+}
+
+{
+  openblas_still_reachable
+  Memcheck:Leak
+  match-leak-kinds: reachable
+  obj:/usr/lib/*/libopenblas*.so*
+}

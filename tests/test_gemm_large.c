@@ -25,7 +25,6 @@ static double run_once(const char *which, int n)
     fill(B, N);
     memset(C, 0, N * 4);
 
-    // warmup
     if (strcmp(which, "baseline") == 0)
         gemm_baseline(n, A, B, C);
     else
@@ -55,8 +54,6 @@ int main(int argc, char **argv)
     int n = atoi(argv[2]);
     int trials = atoi(argv[3]);
 
-    // CSV header to stdout (append rows in your script)
-    // variant,n,threads,flops,time_s,gflops,date
     for (int t = 0; t < trials; t++)
     {
         double time_s = run_once(which, n);

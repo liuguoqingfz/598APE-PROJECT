@@ -1,9 +1,10 @@
 build/
+results/
+*.exe
 *.o
 baseline
 blocked
 sgemm_peak
-stream_c.exe
 .t
 tests/test_gemm_correctness
 tests/test_gemm_large
